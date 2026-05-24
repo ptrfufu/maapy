@@ -1,0 +1,15 @@
+[project]
+name = "maapy"
+version = "0.1.0"
+description = "maa的python绑定 "
+readme = "README.md"
+authors = [
+    { name = "ptrfufu", email = "ptrfufu@outlook.com" }
+]
+requires-python = ">=3.10"
+dependencies = ["cffi>=1.15"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
