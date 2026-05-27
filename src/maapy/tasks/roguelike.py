@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
+from ..constants import RoguelikeThemeCode as RoguelikeTheme
 from ._base import TaskBase
-
-RoguelikeTheme = Literal["Phantom", "Mizuki", "Sami", "Sarkaz", "JieGarden"]
 
 
 @dataclass

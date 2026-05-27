@@ -11,15 +11,17 @@ from pathlib import Path
 from ._ffi import ffi
 
 
-def load_lib(core_dir: str | Path) -> None:
-    """加载 MaaCore DLL/SO 并设置资源路径。
+def load_lib(core_dir: str | Path):
+    """加载 MaaCore DLL/SO 并返回 lib 对象。
 
     Args:
         core_dir: MaaCore.dll 所在目录（也包含 resource 子目录）
 
+    Returns:
+        CFFI lib 对象
+
     Raises:
         OSError: DLL 加载失败
-        RuntimeError: 重复加载
     """
     core_dir = Path(core_dir).resolve()
     if not core_dir.is_dir():
@@ -35,9 +37,10 @@ def load_lib(core_dir: str | Path) -> None:
     original_cwd = os.getcwd()
     try:
         os.chdir(str(core_dir))
-        ffi.dlopen(str(lib_path))
+        lib = ffi.dlopen(str(lib_path))
     finally:
         os.chdir(original_cwd)
+    return lib
 
 
 def _lib_name() -> str:

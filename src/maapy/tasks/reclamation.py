@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
 
+from ..constants import ReclamationThemeCode as ReclamationTheme
 from ._base import TaskBase
-
-ReclamationTheme = Literal["Fire", "Tales", "RelaunchAnchor"]
 
 
 @dataclass

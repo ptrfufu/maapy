@@ -1,30 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
 
+from ..constants import DroneCode as DroneUsage, FacilityCode as FacilityType
 from ._base import TaskBase
-
-FacilityType = Literal[
-    "Mfg",
-    "Trade",
-    "Power",
-    "Control",
-    "Reception",
-    "Office",
-    "Dorm",
-    "Processing",
-    "Training",
-]
-DroneUsage = Literal[
-    "_NotUse",
-    "Money",
-    "SyntheticJade",
-    "CombatRecord",
-    "PureGold",
-    "OriginStone",
-    "Chip",
-]
 
 
 @dataclass

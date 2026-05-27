@@ -40,7 +40,7 @@ class SubTaskStoppedEvent(Event, SubTaskMixin):
 # ── SubTaskExtraInfo (msg=20003) 的 what 变体 ──
 
 @dataclass(slots=True, frozen=True)
-class ProcessTaskEvent(Event):
+class ProcessTaskEvent(Event, SubTaskMixin):
     """subtask=ProcessTask: 通用流程子任务。
 
     details.task 常见值:
@@ -52,8 +52,6 @@ class ProcessTaskEvent(Event):
     task_name: str = ""     # details.task
     exec_times: int = 0     # details.exec_times
     max_times: int = 0      # details.max_times
-    taskchain: str = ""
-    taskid: int = 0
 
 
 @dataclass(slots=True, frozen=True)

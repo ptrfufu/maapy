@@ -24,22 +24,9 @@ def _decode(b: bytes | None) -> str:
     return b.decode("utf-8")
 
 
-def _decode_json(b: bytes | None) -> dict[str, Any]:
-    """C 返回的 JSON bytes → Python dict。"""
-    if b is None:
-        return {}
-    return json.loads(b.decode("utf-8"))
-
-
 def _encode_json(obj: dict[str, Any]) -> bytes:
     """Python dict → JSON bytes。"""
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
-
-
-def _check_bool(result: int, message: str = "操作失败") -> None:
-    """检查 AsstBool 返回值，0 则抛出异常。"""
-    if result == 0:
-        raise RuntimeError(message)
 
 
 # ── 全局函数 ──
@@ -57,10 +44,6 @@ def asst_set_static_option(lib, key: int, value: str) -> bool:
 
 
 # ── 实例生命周期 ──
-
-def asst_create(lib):
-    return lib.AsstCreate()
-
 
 def asst_create_ex(lib, callback, custom_arg=ffi.NULL):
     return lib.AsstCreateEx(callback, custom_arg)

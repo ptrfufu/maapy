@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..constants import ClientCode as ClientType
 from ._base import TaskBase
-from .startup import ClientType
 
 
 @dataclass

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from enum import IntEnum
+from typing import Literal
 
 
 # ═══ 回调消息 ID ═══
@@ -187,3 +188,18 @@ class SubTaskWhat:
     DEPOT = "Depot"
     OPER_BOX = "OperBox"
     UNSUPPORTED_LEVEL = "UnsupportedLevel"
+
+
+# ═══ 类型别名 (供 Task dataclass 注解使用) ═══
+ServerCode = Literal["CN", "US", "JP", "KR"]
+ClientCode = Literal["Official", "Bilibili", "txwy", "YoStarEN", "YoStarJP", "YoStarKR"]
+FacilityCode = Literal[
+    "Mfg", "Trade", "Power", "Control", "Reception",
+    "Office", "Dorm", "Processing", "Training",
+]
+DroneCode = Literal[
+    "_NotUse", "Money", "SyntheticJade", "CombatRecord",
+    "PureGold", "OriginStone", "Chip",
+]
+RoguelikeThemeCode = Literal["Phantom", "Mizuki", "Sami", "Sarkaz", "JieGarden"]
+ReclamationThemeCode = Literal["Fire", "Tales", "RelaunchAnchor"]

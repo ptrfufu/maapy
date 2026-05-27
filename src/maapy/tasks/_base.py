@@ -24,26 +24,34 @@ class TaskBase:
     def to_params(self) -> dict[str, Any]:
         """序列化为 MaaCore JSON。排除 None、_前缀字段、以及值为默认值的字段。"""
         result: dict[str, Any] = {}
-        # 获取 dataclass 字段默认值
-        defaults = {}
-        for f in self.__dataclass_fields__.values():
-            if not f.name.startswith("_"):
-                if f.default is not MISSING:
-                    defaults[f.name] = f.default
-                elif f.default_factory is not MISSING:
-                    defaults[f.name] = f.default_factory()
+        defaults: dict[str, Any] = self._get_field_defaults()
 
         for name, value in vars(self).items():
             if name.startswith("_"):
                 continue
             if value is None:
                 continue
-            # 跳过等于默认值的字段（减小 JSON 体积）
             if name in defaults and value == defaults[name] and name != "enable":
                 continue
             result[name] = value
         result.update(self._extra)
-        # enable 总是输出
         if "enable" not in result:
             result["enable"] = self.enable
         return result
+
+    def _get_field_defaults(self) -> dict[str, Any]:
+        """获取字段默认值，首次调用时计算并缓存到类上。"""
+        cls = type(self)
+        try:
+            return cls._field_defaults
+        except AttributeError:
+            pass
+        defaults: dict[str, Any] = {}
+        for f in cls.__dataclass_fields__.values():
+            if not f.name.startswith("_"):
+                if f.default is not MISSING:
+                    defaults[f.name] = f.default
+                elif f.default_factory is not MISSING:
+                    defaults[f.name] = f.default_factory()
+        cls._field_defaults = defaults
+        return defaults

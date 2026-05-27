@@ -5,17 +5,17 @@
 from __future__ import annotations
 
 import threading
-import time
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from .callback import CallbackManager
 from .events._base import Event
-from .events.global_events import AllTasksCompletedEvent, ConnectionEvent
+from .events.global_events import AllTasksCompletedEvent
 from .events.subtask_events import StageDropsEvent
-from .exceptions import MaaLoadError, MaaTaskError
 from .instance import Instance, get_version, load_and_init, log, set_static_option
 
 
@@ -385,9 +385,6 @@ class MaaClient:
 
     def wait(self, timeout: float | None = None) -> bool:
         """阻塞等待所有任务完成。"""
-        deadline = None if timeout is None else time.monotonic() + timeout
-
-        # 订阅 AllTasksCompleted 事件
         done = threading.Event()
 
         def _on_all_done(event: Event) -> None:

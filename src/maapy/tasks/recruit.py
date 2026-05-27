@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
 
+from ..constants import ServerCode as Server
 from ._base import TaskBase
-
-Server = Literal["CN", "US", "JP", "KR"]
 
 
 @dataclass

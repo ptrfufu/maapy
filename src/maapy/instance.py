@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import time
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -69,19 +69,24 @@ class Instance:
         timeout: float = 30.0,
     ) -> bool:
         """异步连接设备，阻塞等待连接成功或超时。"""
+        from .events._base import Event
+        from .events.global_events import ConnectionEvent
+
         asst_async_connect(self._lib, self._handle, adb_path, address, config, block=False)
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            event = self._callback_mgr.poll(timeout=0.5)
-            if event is not None:
-                from .events.global_events import ConnectionEvent
-                if isinstance(event, ConnectionEvent) and event.connected:
-                    return True
-            if asst_connected(self._lib, self._handle):
-                return True
+        done = threading.Event()
 
-        return False
+        def _on_connected(event: Event) -> None:
+            if isinstance(event, ConnectionEvent) and event.connected:
+                done.set()
+
+        self._callback_mgr.subscribe(ConnectionEvent, _on_connected)
+        try:
+            if done.wait(timeout=timeout):
+                return True
+            return asst_connected(self._lib, self._handle)
+        finally:
+            self._callback_mgr.unsubscribe(ConnectionEvent, _on_connected)
 
     @property
     def connected(self) -> bool:
@@ -174,17 +179,7 @@ def load_and_init(core_dir: str | Path, user_dir: str | None = None) -> str:
         raise MaaLoadError("MaaCore 已加载，不可重复加载")
 
     core_dir = Path(core_dir).resolve()
-    load_lib(core_dir)
-
-    # 获取已加载的 lib 引用——CFFI dlopen 返回的就是 lib 对象
-    # ffi.dlopen 的库对象存在 CFFI 内部，我们需要重新获取它
-    import os
-    original_cwd = os.getcwd()
-    try:
-        os.chdir(str(core_dir))
-        _lib = ffi.dlopen("MaaCore.dll" if __import__("sys").platform == "win32" else "libMaaCore.so")
-    finally:
-        os.chdir(original_cwd)
+    _lib = load_lib(core_dir)
 
     version = ffi.string(cast(Any, _lib).AsstGetVersion()).decode("utf-8")
 
