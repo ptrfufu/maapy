@@ -51,3 +51,12 @@ class AsyncCallInfoEvent(Event):
 class DestroyedEvent(Event):
     """msg=5: 实例已销毁。"""
     pass
+
+
+@dataclass(slots=True, frozen=True)
+class ReportRequestEvent(Event):
+    """msg=30000: 上报请求，需 UI 层执行 HTTP 上报。"""
+    url: str = ""
+    headers: dict = field(default_factory=dict)
+    body: str = ""
+    subtask: str = ""

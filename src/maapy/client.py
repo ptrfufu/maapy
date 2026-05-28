@@ -173,6 +173,59 @@ class TaskHandle:
             return self.result
         return None
 
+    async def wait_async(self, timeout: float | None = None) -> TaskResult | None:
+        """异步等待此任务完成（不阻塞事件循环）。"""
+        import asyncio
+        return await asyncio.get_running_loop().run_in_executor(None, self.wait, timeout)
+
+    def stream(self, event_type: type):
+        """流式生成器，逐次 yields 指定类型的事件直至任务结束。
+
+        Usage:
+            for event in task.stream(OperBoxEvent):
+                print(f"进度: {len(event.own_opers)} 干员")
+                if event.done:
+                    print("识别完成!")
+        """
+        import queue
+
+        q: queue.Queue[Event | None] = queue.Queue()
+
+        def _handler(e: Event) -> None:
+            q.put(e)
+
+        def _on_stop(e: Event) -> None:
+            if getattr(e, "taskid", 0) == self.taskid:
+                q.put(None)  # sentinel
+
+        from .events.taskchain_events import (
+            TaskChainCompletedEvent,
+            TaskChainErrorEvent,
+            TaskChainStoppedEvent,
+        )
+        from .events.subtask_events import SubTaskCompletedEvent, SubTaskErrorEvent
+
+        self._cb_mgr.subscribe(event_type, _handler, tag=self.tag)
+        self._cb_mgr.subscribe(SubTaskCompletedEvent, _on_stop, taskid=self.taskid)
+        self._cb_mgr.subscribe(SubTaskErrorEvent, _on_stop, taskid=self.taskid)
+        self._cb_mgr.subscribe(TaskChainCompletedEvent, _on_stop, taskid=self.taskid)
+        self._cb_mgr.subscribe(TaskChainErrorEvent, _on_stop, taskid=self.taskid)
+        self._cb_mgr.subscribe(TaskChainStoppedEvent, _on_stop, taskid=self.taskid)
+
+        try:
+            while True:
+                event = q.get()
+                if event is None:
+                    break
+                yield event
+        finally:
+            self._cb_mgr.unsubscribe(event_type, _handler)
+            self._cb_mgr.unsubscribe(SubTaskCompletedEvent, _on_stop)
+            self._cb_mgr.unsubscribe(SubTaskErrorEvent, _on_stop)
+            self._cb_mgr.unsubscribe(TaskChainCompletedEvent, _on_stop)
+            self._cb_mgr.unsubscribe(TaskChainErrorEvent, _on_stop)
+            self._cb_mgr.unsubscribe(TaskChainStoppedEvent, _on_stop)
+
     # ── 内部 ──
 
     def _setup_auto_tracking(self) -> None:
@@ -395,6 +448,11 @@ class MaaClient:
             return done.wait(timeout=timeout)
         finally:
             self._callback_mgr.unsubscribe(AllTasksCompletedEvent, _on_all_done)
+
+    async def wait_async(self, timeout: float | None = None) -> bool:
+        """异步等待所有任务完成（不阻塞事件循环）。"""
+        import asyncio
+        return await asyncio.get_running_loop().run_in_executor(None, self.wait, timeout)
 
     def cancel_task(self, id_or_tag: int | str) -> bool:
         """取消指定任务。"""

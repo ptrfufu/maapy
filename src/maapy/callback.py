@@ -23,8 +23,10 @@ from .events.global_events import (
     DestroyedEvent,
     InitFailedEvent,
     InternalErrorEvent,
+    ReportRequestEvent,
 )
 from .events.subtask_events import (
+    DepotEvent,
     FacilityEvent,
     OperBoxEvent,
     ProcessTaskEvent,
@@ -86,6 +88,11 @@ class CallbackManager:
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
 
+        # 流式数据缓冲区: {taskid: {"all_opers": [...], "own_opers": [...], ...}}
+        self._streaming_buffers: dict[int, dict] = defaultdict(
+            lambda: {"all_opers": [], "own_opers": [], "depot_items": []}
+        )
+
         # 启动 daemon 线程持续分发事件
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop, daemon=True, name="maapy-dispatch"
@@ -109,20 +116,24 @@ class CallbackManager:
             AsstMsg.SUB_TASK_COMPLETED:   self._parse_subtask,
             AsstMsg.SUB_TASK_EXTRA_INFO:  self._parse_subtask,
             AsstMsg.SUB_TASK_STOPPED:     self._parse_subtask,
+            AsstMsg.REPORT_REQUEST:      self._parse_report_request,
         }
 
         self._subtask_extra_parsers: dict[str, Callable] = {
             "StageDrops":             self._parse_stage_drops,
             "RecruitTagsDetected":    self._parse_recruit_tags_detected,
             "RecruitSpecialTag":      self._parse_recruit_special_tag,
+            "RecruitPreservedTag":    self._parse_recruit_preserved_tag,
             "RecruitResult":          self._parse_recruit_result,
             "RecruitTagsRefreshed":   self._parse_recruit_tags_refreshed,
             "RecruitTagsSelected":    self._parse_recruit_tags_selected,
+            "RecruitNoPermit":        self._parse_recruit_no_permit,
             "EnterFacility":          self._parse_facility,
             "NotEnoughStaff":         self._parse_facility,
             "ProductOfFacility":      self._parse_facility,
             "StageInfo":              self._parse_stage_info,
-            "OperBox":                self._parse_operbox,
+            "OperBoxInfo":            self._parse_operbox,
+            "DepotInfo":              self._parse_depot,
         }
 
         self._taskchain_event_classes: dict[AsstMsg, type] = {
@@ -284,6 +295,15 @@ class CallbackManager:
     def _parse_destroyed(self, msg_id: AsstMsg, data: dict) -> Event:
         return DestroyedEvent(msg=int(msg_id), uuid=data.get("uuid", ""), raw=data)
 
+    def _parse_report_request(self, msg_id: AsstMsg, data: dict) -> Event:
+        return ReportRequestEvent(
+            msg=int(msg_id), uuid=data.get("uuid", ""), raw=data,
+            url=data.get("url", ""),
+            headers=data.get("headers", {}),
+            body=data.get("body", ""),
+            subtask=data.get("subtask", ""),
+        )
+
     # ── TaskChain / SubTask 解析 ──
 
     def _parse_taskchain(self, msg_id: AsstMsg, data: dict) -> Event:
@@ -364,6 +384,8 @@ class CallbackManager:
             task_name=sub_details.get("task", ""),
             exec_times=sub_details.get("exec_times", 0),
             max_times=sub_details.get("max_times", 0),
+            action=sub_details.get("action", 0),
+            algorithm=sub_details.get("algorithm", 0),
         )
 
     def _parse_stage_drops(
@@ -393,6 +415,12 @@ class CallbackManager:
             tags=[data.get("details", {}).get("tag", "")],
         )
 
+    def _parse_recruit_preserved_tag(self, data: dict, **kwargs) -> Event:
+        return RecruitTagsDetectedEvent(
+            **kwargs,
+            tags=[data.get("details", {}).get("tag", "")],
+        )
+
     def _parse_recruit_result(self, data: dict, **kwargs) -> Event:
         sub_details = data.get("details", {})
         return RecruitResultEvent(
@@ -401,6 +429,9 @@ class CallbackManager:
             level=sub_details.get("level", 0),
             result=[RecruitOption(**r) for r in sub_details.get("result", [])],
         )
+
+    def _parse_recruit_no_permit(self, _data: dict, **kwargs) -> Event:
+        return UnknownSubTaskEvent(**kwargs)
 
     def _parse_recruit_tags_refreshed(self, data: dict, **kwargs) -> Event:
         sub_details = data.get("details", {})
@@ -433,14 +464,57 @@ class CallbackManager:
             name=data.get("details", {}).get("name", ""),
         )
 
-    def _parse_operbox(self, data: dict, **kwargs) -> Event:
+    def _parse_operbox(self, data: dict, **kwargs) -> Event | None:
+        """流式干员数据：C++ 每次回调发送全量 m_own_opers 和全量 all_opers。
+
+        中间分片和最终回调均触发事件，用户可通过 done 字段区分。
+        """
+        taskid = kwargs.get("taskid", 0)
         sub_details = data.get("details", {})
-        return OperBoxEvent(
+        done: bool = sub_details.get("done", False)
+
+        event = OperBoxEvent(
             **kwargs,
-            done=sub_details.get("done", False),
+            done=done,
             all_opers=sub_details.get("all_opers", []),
             own_opers=sub_details.get("own_opers", []),
         )
+
+        if done and taskid in self._streaming_buffers:
+            del self._streaming_buffers[taskid]
+
+        return event
+
+    def _parse_depot(self, data: dict, **kwargs) -> Event | None:
+        """流式仓库数据：C++ 每次回调发送全量 m_all_items 的 JSON string。
+
+        中间分片和最终回调均触发事件，用户可通过 done 字段区分。
+        details.data 是 JSON 字符串，解析后为 {item_id: quantity, ...}。
+        """
+        import json
+
+        taskid = kwargs.get("taskid", 0)
+        sub_details = data.get("details", {})
+        done: bool = sub_details.get("done", False)
+        data_str: str = sub_details.get("data", "")
+
+        parsed: dict = {}
+        if data_str:
+            try:
+                parsed = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        event = DepotEvent(
+            **kwargs,
+            done=done,
+            items=parsed if isinstance(parsed, dict) else {},
+        )
+
+        if done and taskid in self._streaming_buffers:
+            del self._streaming_buffers[taskid]
+
+        return event
 
     # ── 事件分发 ──
 

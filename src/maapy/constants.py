@@ -40,6 +40,9 @@ class AsstMsg(IntEnum):
     SUB_TASK_EXTRA_INFO = 20003
     SUB_TASK_STOPPED = 20004
 
+    # 上报请求 (30000)
+    REPORT_REQUEST = 30000
+
 
 # ═══ 任务类型 ═══
 
@@ -64,6 +67,7 @@ class AsstTaskType:
     CUSTOM = "Custom"
     SINGLE_STEP = "SingleStep"
     VIDEO_RECOGNITION = "VideoRecognition"
+    DEBUG = "Debug"
 
 
 # ═══ 客户端类型 ═══
@@ -173,6 +177,7 @@ class SubTaskWhat:
     STAGE_DROPS = "StageDrops"
     RECRUIT_TAGS_DETECTED = "RecruitTagsDetected"
     RECRUIT_SPECIAL_TAG = "RecruitSpecialTag"
+    RECRUIT_PRESERVED_TAG = "RecruitPreservedTag"
     RECRUIT_RESULT = "RecruitResult"
     RECRUIT_TAGS_REFRESHED = "RecruitTagsRefreshed"
     RECRUIT_NO_PERMIT = "RecruitNoPermit"
@@ -185,8 +190,8 @@ class SubTaskWhat:
     STAGE_INFO = "StageInfo"
     STAGE_INFO_ERROR = "StageInfoError"
     PENGUIN_ID = "PenguinId"
-    DEPOT = "Depot"
-    OPER_BOX = "OperBox"
+    DEPOT = "DepotInfo"
+    OPER_BOX = "OperBoxInfo"
     UNSUPPORTED_LEVEL = "UnsupportedLevel"
 
 

@@ -8,8 +8,10 @@ from .global_events import (
     DestroyedEvent,
     InitFailedEvent,
     InternalErrorEvent,
+    ReportRequestEvent,
 )
 from .subtask_events import (
+    DepotEvent,
     FacilityEvent,
     OperBoxEvent,
     ProcessTaskEvent,
@@ -59,7 +61,9 @@ __all__ = [
     "RecruitResultEvent",
     "RecruitTagsRefreshedEvent",
     "RecruitTagsSelectedEvent",
+    "DepotEvent",
     "FacilityEvent",
     "OperBoxEvent",
     "UnknownSubTaskEvent",
+    "ReportRequestEvent",
 ]

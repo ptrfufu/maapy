@@ -52,6 +52,8 @@ class ProcessTaskEvent(Event, SubTaskMixin):
     task_name: str = ""     # details.task
     exec_times: int = 0     # details.exec_times
     max_times: int = 0      # details.max_times
+    action: int = 0         # details.action
+    algorithm: int = 0      # details.algorithm
 
 
 @dataclass(slots=True, frozen=True)
@@ -118,6 +120,16 @@ class OperBoxEvent(Event, SubTaskMixin):
     done: bool = False
     all_opers: list[dict] = field(default_factory=list)
     own_opers: list[dict] = field(default_factory=list)
+
+
+@dataclass(slots=True, frozen=True)
+class DepotEvent(Event, SubTaskMixin):
+    """what=DepotInfo: 仓库识别结果（流式累加，done=true 时触发）。
+
+    items 为 {item_id: quantity, ...} 字典。
+    """
+    done: bool = False
+    items: dict = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)

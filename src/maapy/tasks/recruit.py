@@ -17,7 +17,8 @@ class RecruitTask(TaskBase):
     set_time: bool = True
     expedite: bool = False
     expedite_times: int = 0
-    skip_robot: bool = True
+    skip_robot: bool = True  # 已废弃，请使用 skip_tags
+    skip_tags: list[str] = field(default_factory=list)
     recruitment_time: dict[str, int] = field(default_factory=dict)  # {"3":540,"4":540}
     report_to_penguin: bool = False
     penguin_id: str = ""
