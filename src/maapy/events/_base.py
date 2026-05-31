@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 
 @dataclass(slots=True, frozen=True)
@@ -11,7 +10,6 @@ class Event:
     """所有回调事件的基类。"""
     msg: int
     uuid: str
-    raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)

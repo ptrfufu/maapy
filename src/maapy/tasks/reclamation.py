@@ -10,9 +10,10 @@ from ._base import TaskBase
 class ReclamationTask(TaskBase):
     theme: ReclamationTheme = "Tales"
     mode: int = 0
-    tools_to_craft: list[str] = field(default_factory=lambda: ["荧光棒"])
-    increment_mode: int = 0  # 0=递增, 1=递减
+    increment_mode: int = 0
     num_craft_batches: int = 16
+    tools_to_craft: list[str] = field(default_factory=list)
+    clear_store: bool = False
     enable: bool = True
 
     @classmethod

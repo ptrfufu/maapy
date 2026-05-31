@@ -22,6 +22,14 @@ class InfrastTask(TaskBase):
     plan_index: int = 0  # mode=10000 时必填
     enable: bool = True
 
+    def validate(self, *, partial: bool = False) -> None:
+        super().validate(partial=partial)
+        if not partial:
+            self._require(self.facility, "facility")
+        self._require_range(self.threshold, "threshold", 0, 1)
+        if self.mode == 10000:
+            self._require(self.filename, "filename")
+
     @classmethod
     def task_type(cls) -> str:
         return "Infrast"

@@ -1,25 +1,33 @@
-"""任务构造器——所有任务类型的 dataclass 定义。
-
-每个类对应一种 AsstAppendTask 的 type 参数，
-
-"""
-
-from ._base import TaskBase
+from ._base import JsonModel, TaskBase
 from .award import AwardTask
 from .closedown import CloseDownTask
-from .copilot import CopilotTask, SSSCopilotTask
-from .custom import CustomTask, SingleStepTask, VideoRecognitionTask
+from .copilot import (
+    CopilotMultiTask,
+    CopilotTask,
+    CopilotUserAdditional,
+    ParadoxCopilotTask,
+    SSSCopilotTask,
+)
+from .custom import (
+    CustomTask,
+    SingleStepCopilotAction,
+    SingleStepCopilotStageDetails,
+    SingleStepTask,
+    VideoRecognitionTask,
+)
+from .debug import DebugTask
 from .depot import DepotTask
 from .fight import FightTask
 from .infrast import InfrastTask
 from .mall import MallTask
 from .operbox import OperBoxTask
 from .reclamation import ReclamationTask
-from .recruit import RecruitTask
+from .recruit import RecruitTask, RecruitmentTime
 from .roguelike import RoguelikeTask
 from .startup import StartUpTask
 
 __all__ = [
+    "JsonModel",
     "TaskBase",
     "StartUpTask",
     "CloseDownTask",
@@ -31,6 +39,13 @@ __all__ = [
     "RoguelikeTask",
     "CopilotTask",
     "SSSCopilotTask",
+    "ParadoxCopilotTask",
+    "DebugTask",
+    "CopilotMultiTask",
+    "CopilotUserAdditional",
+    "SingleStepCopilotStageDetails",
+    "SingleStepCopilotAction",
+    "RecruitmentTime",
     "DepotTask",
     "OperBoxTask",
     "ReclamationTask",

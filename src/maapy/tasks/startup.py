@@ -13,6 +13,11 @@ class StartUpTask(TaskBase):
     account_name: str = ""
     enable: bool = True
 
+    def validate(self, *, partial: bool = False) -> None:
+        super().validate(partial=partial)
+        if not partial:
+            self._require(self.client_type, "client_type")
+
     @classmethod
     def task_type(cls) -> str:
         return "StartUp"

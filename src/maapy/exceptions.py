@@ -23,6 +23,11 @@ class MaaTaskError(MaaError):
     pass
 
 
+class MaaValidationError(MaaError, ValueError):
+    """Python 侧参数校验失败。"""
+    pass
+
+
 class MaaDataError(MaaError):
     """数据获取失败（截图、UUID 等）。"""
     pass

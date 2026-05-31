@@ -14,6 +14,11 @@
 """
 
 from .client import MaaClient, TaskHandle, TaskResult, TaskStatus
+from .connection import (
+    ConnectionExtras,
+    LDPlayerConnectionExtras,
+    MuMuConnectionExtras,
+)
 from .constants import (
     AsstMsg,
     AsstTaskType,
@@ -26,15 +31,25 @@ from .constants import (
     Server,
     StaticOptionKey,
     SubTaskWhat,
+    Win32InputMethod,
+    Win32ScreencapMethod,
 )
 from .events import (
     AllTasksCompletedEvent,
     AsyncCallInfoEvent,
+    CallbackErrorEvent,
     ConnectionEvent,
+    E,
+    AppendTask,
+    CancelAndAppend,
+    CancelTask,
+    Continue,
     StageDropsEvent,
+    StopCore,
     TaskChainCompletedEvent,
     TaskChainErrorEvent,
     TaskChainStartEvent,
+    UpdateParams,
 )
 from .exceptions import (
     MaaCallbackError,
@@ -43,6 +58,7 @@ from .exceptions import (
     MaaError,
     MaaLoadError,
     MaaTaskError,
+    MaaValidationError,
 )
 
 __all__ = [
@@ -50,12 +66,28 @@ __all__ = [
     "TaskHandle",
     "TaskResult",
     "TaskStatus",
+    "ConnectionExtras",
+    "MuMuConnectionExtras",
+    "LDPlayerConnectionExtras",
     "AsstMsg",
     "AsstTaskType",
+    "StaticOptionKey",
+    "InstanceOptionKey",
+    "Win32ScreencapMethod",
+    "Win32InputMethod",
     "MaaError",
     "MaaLoadError",
     "MaaConnectionError",
     "MaaTaskError",
+    "MaaValidationError",
     "MaaDataError",
     "MaaCallbackError",
+    "CallbackErrorEvent",
+    "E",
+    "Continue",
+    "StopCore",
+    "CancelTask",
+    "AppendTask",
+    "CancelAndAppend",
+    "UpdateParams",
 ]

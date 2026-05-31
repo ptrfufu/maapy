@@ -1,72 +1,67 @@
-"""回调管理器——C 回调 → 事件解析 → 路由分发。
-
-C 线程回调只做解析 + 入队；后台 daemon 线程持续 drain 并 dispatch，
-确保用户事件处理器在 Python 线程中执行，不阻塞 MaaCore C++ 工作线程。
-"""
+"""回调管理器，负责把 MaaCore 回调解析为强类型事件并完成线程安全分发"""
 
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import threading
 from collections import defaultdict
+from dataclasses import dataclass, field
+from itertools import chain
 from typing import Callable
 
+from ._callback.parser import CallbackParser
 from ._ffi import ASST_API_CALLBACK_TYPE, ffi
+from ._json import JsonDict, decode_json_dict
 from .constants import AsstMsg
 from .events._base import Event
-from .events.global_events import (
-    AllTasksCompletedEvent,
-    AsyncCallInfoEvent,
-    ConnectionEvent,
-    DestroyedEvent,
-    InitFailedEvent,
-    InternalErrorEvent,
-    ReportRequestEvent,
-)
-from .events.subtask_events import (
-    DepotEvent,
-    FacilityEvent,
-    OperBoxEvent,
-    ProcessTaskEvent,
-    RecruitResultEvent,
-    RecruitTagsDetectedEvent,
-    RecruitTagsRefreshedEvent,
-    RecruitTagsSelectedEvent,
-    StageDropsEvent,
-    StageInfoEvent,
-    SubTaskCompletedEvent,
-    SubTaskErrorEvent,
-    SubTaskStartedEvent,
-    SubTaskStoppedEvent,
-    UnknownSubTaskEvent,
-)
-from .events.taskchain_events import (
-    TaskChainCompletedEvent,
-    TaskChainErrorEvent,
-    TaskChainExtraInfoEvent,
-    TaskChainStartEvent,
-    TaskChainStoppedEvent,
-)
+from .events.global_events import CallbackErrorEvent
+from .events.subtask_events import StageDropsEvent
 
 _logger = logging.getLogger(__name__)
 
 _MAX_TASK_EVENTS = 10000
 
 
+class _StopEvent:
+    pass
+
+
+_STOP_EVENT = _StopEvent()
+
+
+@dataclass(frozen=True)
+class Subscription:
+    """可释放的订阅句柄，避免任务结束后监听器常驻"""
+
+    manager: "CallbackManager"
+    event_type: type
+    handler: Callable[[Event], None]
+
+    def close(self) -> None:
+        self.manager.unsubscribe(self.event_type, self.handler)
+
+
+@dataclass(slots=True)
+class _TaskAccumulator:
+    """任务级聚合态——跨回调累加的业务数据（目前仅用于掉落统计）。"""
+
+    stats: dict[str, int] = field(default_factory=dict)
+
+
 class CallbackManager:
-    """管理 C 回调的生命周期、线程安全队列和事件分发。
+    """管理 C 回调的生命周期、解析过程和事件分发。
 
-    三级路由:
-      1. msg id → 事件类
-      2. what / subtask → 专用解析器
-      3. 未知 → UnknownEvent (保留 raw dict)
-
-    C 回调只负责解析 + 入队；后台 daemon 线程持续 dispatch。
+    使用 CallbackParser 组合（非 mixin 继承）处理 JSON 解析。
     """
 
+    @staticmethod
+    def _on_callback_error(event: Event) -> None:
+        _logger.error("maapy 事件处理器异常 [%s]: %s", getattr(event, "source", "?"), getattr(event, "error", "?"))
+
     def __init__(self) -> None:
+        self._parser = CallbackParser()
+
         self._listeners: dict[type, list[Callable[[Event], None]]] = defaultdict(list)
         self._tag_listeners: dict[str, dict[type, list[Callable[[Event], None]]]] = defaultdict(
             lambda: defaultdict(list)
@@ -75,88 +70,50 @@ class CallbackManager:
             lambda: defaultdict(list)
         )
 
+        # handler → {(event_type, tag_or_None, taskid_or_None), ...} 反向索引
+        self._handler_registry: dict[int, set[tuple[type, str | None, int | None]]] = defaultdict(set)
+
         self._taskid_to_tag: dict[int, str] = {}
-
-        self._msg_queue: queue.Queue[Event] = queue.Queue()
-
+        self._msg_queue: queue.Queue[Event | _StopEvent] = queue.Queue()
         self._task_events: dict[str, list[Event]] = defaultdict(list)
+        self._event_archive: list[Event] = []
+        self._closed = False
 
-        self._accumulators: dict[int, dict] = defaultdict(
-            lambda: {"stats": {}, "exec_times": 0, "medicine_used": 0}
-        )
+        self._accumulators: dict[int, _TaskAccumulator] = defaultdict(_TaskAccumulator)
 
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
 
-        # 流式数据缓冲区: {taskid: {"all_opers": [...], "own_opers": [...], ...}}
-        self._streaming_buffers: dict[int, dict] = defaultdict(
-            lambda: {"all_opers": [], "own_opers": [], "depot_items": []}
-        )
-
-        # 启动 daemon 线程持续分发事件
         self._dispatch_thread = threading.Thread(
-            target=self._dispatch_loop, daemon=True, name="maapy-dispatch"
+            target=self._dispatch_loop,
+            daemon=True,
+            name="maapy-dispatch",
         )
         self._dispatch_thread.start()
 
-        self._msg_dispatch: dict[AsstMsg, Callable] = {
-            AsstMsg.INTERNAL_ERROR:       self._parse_internal_error,
-            AsstMsg.INIT_FAILED:          self._parse_init_failed,
-            AsstMsg.CONNECTION_INFO:      self._parse_connection_info,
-            AsstMsg.ALL_TASKS_COMPLETED:  self._parse_all_tasks_completed,
-            AsstMsg.ASYNC_CALL_INFO:      self._parse_async_call_info,
-            AsstMsg.DESTROYED:            self._parse_destroyed,
-            AsstMsg.TASK_CHAIN_ERROR:     self._parse_taskchain,
-            AsstMsg.TASK_CHAIN_START:     self._parse_taskchain,
-            AsstMsg.TASK_CHAIN_COMPLETED: self._parse_taskchain,
-            AsstMsg.TASK_CHAIN_EXTRA_INFO: self._parse_taskchain,
-            AsstMsg.TASK_CHAIN_STOPPED:   self._parse_taskchain,
-            AsstMsg.SUB_TASK_ERROR:       self._parse_subtask,
-            AsstMsg.SUB_TASK_START:       self._parse_subtask,
-            AsstMsg.SUB_TASK_COMPLETED:   self._parse_subtask,
-            AsstMsg.SUB_TASK_EXTRA_INFO:  self._parse_subtask,
-            AsstMsg.SUB_TASK_STOPPED:     self._parse_subtask,
-            AsstMsg.REPORT_REQUEST:      self._parse_report_request,
-        }
-
-        self._subtask_extra_parsers: dict[str, Callable] = {
-            "StageDrops":             self._parse_stage_drops,
-            "RecruitTagsDetected":    self._parse_recruit_tags_detected,
-            "RecruitSpecialTag":      self._parse_recruit_special_tag,
-            "RecruitPreservedTag":    self._parse_recruit_preserved_tag,
-            "RecruitResult":          self._parse_recruit_result,
-            "RecruitTagsRefreshed":   self._parse_recruit_tags_refreshed,
-            "RecruitTagsSelected":    self._parse_recruit_tags_selected,
-            "RecruitNoPermit":        self._parse_recruit_no_permit,
-            "EnterFacility":          self._parse_facility,
-            "NotEnoughStaff":         self._parse_facility,
-            "ProductOfFacility":      self._parse_facility,
-            "StageInfo":              self._parse_stage_info,
-            "OperBoxInfo":            self._parse_operbox,
-            "DepotInfo":              self._parse_depot,
-        }
-
-        self._taskchain_event_classes: dict[AsstMsg, type] = {
-            AsstMsg.TASK_CHAIN_ERROR:       TaskChainErrorEvent,
-            AsstMsg.TASK_CHAIN_START:       TaskChainStartEvent,
-            AsstMsg.TASK_CHAIN_COMPLETED:   TaskChainCompletedEvent,
-            AsstMsg.TASK_CHAIN_EXTRA_INFO:  TaskChainExtraInfoEvent,
-            AsstMsg.TASK_CHAIN_STOPPED:     TaskChainStoppedEvent,
-        }
-
-        self._subtask_event_classes: dict[AsstMsg, type] = {
-            AsstMsg.SUB_TASK_ERROR:      SubTaskErrorEvent,
-            AsstMsg.SUB_TASK_START:      SubTaskStartedEvent,
-            AsstMsg.SUB_TASK_COMPLETED:  SubTaskCompletedEvent,
-            AsstMsg.SUB_TASK_STOPPED:    SubTaskStoppedEvent,
-        }
-
         self._c_callback = self._make_c_callback()
+
+        # 默认监听 CallbackErrorEvent，确保 handler 异常总是可见
+        self.subscribe(CallbackErrorEvent, self._on_callback_error)
+
+    # ── 公开方法 ──
 
     def register_tag(self, taskid: int, tag: str) -> None:
         self._taskid_to_tag[taskid] = tag
 
-    # ── 订阅管理 ──
+    def close(self, timeout: float = 1.0) -> None:
+        """关闭后台分发线程并释放所有订阅"""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._shutdown.set()
+            self._listeners.clear()
+            self._tag_listeners.clear()
+            self._taskid_listeners.clear()
+            self._handler_registry.clear()
+        self._msg_queue.put(_STOP_EVENT)
+        self._dispatch_thread.join(timeout=timeout)
 
     def subscribe(
         self,
@@ -165,400 +122,45 @@ class CallbackManager:
         *,
         taskid: int | None = None,
         tag: str | None = None,
-    ) -> None:
-        if taskid is not None:
-            self._taskid_listeners[taskid][event_type].append(handler)
-        elif tag is not None:
-            self._tag_listeners[tag][event_type].append(handler)
-        else:
-            self._listeners[event_type].append(handler)
+    ) -> Subscription:
+        with self._lock:
+            if taskid is not None:
+                self._taskid_listeners[taskid][event_type].append(handler)
+            elif tag is not None:
+                self._tag_listeners[tag][event_type].append(handler)
+            else:
+                self._listeners[event_type].append(handler)
+            self._handler_registry[id(handler)].add((event_type, tag, taskid))
+        return Subscription(self, event_type, handler)
 
     def unsubscribe(self, event_type: type, handler: Callable[[Event], None]) -> None:
-        if handler in self._listeners.get(event_type, []):
-            self._listeners[event_type].remove(handler)
-        for tag_handlers in self._tag_listeners.values():
-            if handler in tag_handlers.get(event_type, []):
-                tag_handlers[event_type].remove(handler)
-        for tid_handlers in self._taskid_listeners.values():
-            if handler in tid_handlers.get(event_type, []):
-                tid_handlers[event_type].remove(handler)
+        """通过反向索引 O(1) 定位并移除 handler。"""
+        handler_id = id(handler)
+        with self._lock:
+            registrations = self._handler_registry.pop(handler_id, set())
+            for ev_type, tag, taskid in registrations:
+                if ev_type is not event_type:
+                    # 同一个 handler 可能被注册到不同 event_type（通过 off() 的 wrapper）
+                    # 这里只移除匹配 event_type 的注册
+                    self._handler_registry[handler_id].add((ev_type, tag, taskid))
+                    continue
+                if taskid is not None:
+                    lst = self._taskid_listeners.get(taskid, {}).get(ev_type)
+                elif tag is not None:
+                    lst = self._tag_listeners.get(tag, {}).get(ev_type)
+                else:
+                    lst = self._listeners.get(ev_type)
+                if lst is not None and handler in lst:
+                    lst.remove(handler)
 
-    # ── 消息队列 ──
-
-    def _dispatch_loop(self) -> None:
-        """Daemon 线程：持续 drain 队列并 dispatch 事件。"""
-        while not self._shutdown.is_set():
-            try:
-                event = self._msg_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            except Exception:
-                continue
-            try:
-                self._dispatch(event)
-            except Exception:
-                _logger.debug("Dispatch loop error", exc_info=True)
-
-    def poll(self, timeout: float = 0) -> Event | None:
-        """获取并分发一个事件（daemon 之外兜底）。"""
-        try:
-            event = self._msg_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-        self._dispatch(event)
-        return event
-
-    def drain(self) -> list[Event]:
-        """获取并分发队列中所有事件（daemon 之外兜底）。"""
-        events: list[Event] = []
-        while not self._msg_queue.empty():
-            try:
-                events.append(self._msg_queue.get_nowait())
-            except queue.Empty:
-                break
-        for event in events:
-            self._dispatch(event)
-        return events
-
-    # ── C 回调属性 ──
+    def archived_events(self) -> list[Event]:
+        """返回已分发事件快照，避免和后台线程竞争同一个队列"""
+        with self._lock:
+            return list(self._event_archive)
 
     @property
     def c_callback(self):
         return self._c_callback
-
-    # ── C 回调 ──
-
-    def _make_c_callback(self):
-        """创建 C 回调——运行在 C++ 工作线程，只做解析 + 入队。"""
-
-        @ffi.callback(ASST_API_CALLBACK_TYPE)
-        def _cb(msg: int, details_json, custom_arg) -> None:
-            try:
-                raw_bytes: bytes = ffi.string(details_json)  # type: ignore[assignment]
-                data = json.loads(raw_bytes.decode("utf-8")) if details_json != ffi.NULL else {}
-                event = self._parse_and_route(msg, data)
-                if event is not None:
-                    self._msg_queue.put(event)
-            except Exception:
-                _logger.debug("C callback parse error", exc_info=True)
-
-        return _cb
-
-    # ── 一级路由 — dict dispatch ──
-
-    def _parse_and_route(self, msg: int, data: dict) -> Event | None:
-        msg_id = AsstMsg(msg)
-        parser = self._msg_dispatch.get(msg_id)
-        if parser is not None:
-            return parser(msg_id, data)
-        return None
-
-    # ── 全局事件解析器 ──
-
-    def _parse_internal_error(self, msg_id: AsstMsg, data: dict) -> Event:
-        return InternalErrorEvent(msg=int(msg_id), uuid="", raw=data)
-
-    def _parse_init_failed(self, msg_id: AsstMsg, data: dict) -> Event:
-        return InitFailedEvent(
-            msg=int(msg_id), uuid="", raw=data,
-            what=data.get("what", ""),
-            why=data.get("why", ""),
-            details=data.get("details", {}),
-        )
-
-    def _parse_connection_info(self, msg_id: AsstMsg, data: dict) -> Event:
-        what = data.get("what", "")
-        return ConnectionEvent(
-            msg=int(msg_id), uuid=data.get("uuid", ""), raw=data,
-            what=what, why=data.get("why", ""),
-            details=data.get("details", {}),
-            connected=what in ("Connected", "UuidGot"),
-        )
-
-    def _parse_all_tasks_completed(self, msg_id: AsstMsg, data: dict) -> Event:
-        return AllTasksCompletedEvent(
-            msg=int(msg_id), uuid=data.get("uuid", ""), raw=data,
-            taskchain=data.get("taskchain", ""),
-            finished_tasks=data.get("finished_tasks", []),
-        )
-
-    def _parse_async_call_info(self, msg_id: AsstMsg, data: dict) -> Event:
-        d = data.get("details", {})
-        return AsyncCallInfoEvent(
-            msg=int(msg_id), uuid=data.get("uuid", ""), raw=data,
-            what=data.get("what", ""),
-            async_call_id=data.get("async_call_id", 0),
-            ret=d.get("ret", False),
-            cost=d.get("cost", 0),
-        )
-
-    def _parse_destroyed(self, msg_id: AsstMsg, data: dict) -> Event:
-        return DestroyedEvent(msg=int(msg_id), uuid=data.get("uuid", ""), raw=data)
-
-    def _parse_report_request(self, msg_id: AsstMsg, data: dict) -> Event:
-        return ReportRequestEvent(
-            msg=int(msg_id), uuid=data.get("uuid", ""), raw=data,
-            url=data.get("url", ""),
-            headers=data.get("headers", {}),
-            body=data.get("body", ""),
-            subtask=data.get("subtask", ""),
-        )
-
-    # ── TaskChain / SubTask 解析 ──
-
-    def _parse_taskchain(self, msg_id: AsstMsg, data: dict) -> Event:
-        cls = self._taskchain_event_classes.get(msg_id, TaskChainExtraInfoEvent)
-        return cls(
-            msg=int(msg_id), uuid=data.get("uuid", ""), raw=data,
-            taskchain=data.get("taskchain", ""), taskid=data.get("taskid", 0),
-        )
-
-    def _parse_subtask(self, msg_id: AsstMsg, data: dict) -> Event:
-        msg = int(msg_id)
-        uuid: str = data.get("uuid", "")
-        subtask: str = data.get("subtask", "")
-        class_name: str = data.get("class", "")
-        taskchain: str = data.get("taskchain", "")
-        taskid: int = data.get("taskid", 0)
-
-        if msg_id == AsstMsg.SUB_TASK_EXTRA_INFO:
-            return self._parse_subtask_extra(
-                data, msg=msg, uuid=uuid, subtask=subtask,
-                class_name=class_name, taskchain=taskchain, taskid=taskid,
-            )
-
-        cls = self._subtask_event_classes.get(msg_id)
-        if cls is None:
-            return UnknownSubTaskEvent(
-                msg=msg, uuid=uuid, raw=data,
-                subtask=subtask, class_name=class_name,
-                taskchain=taskchain, taskid=taskid,
-            )
-
-        if msg_id == AsstMsg.SUB_TASK_START:
-            d = data.get("details", {})
-            return cls(
-                msg=msg, uuid=uuid, raw=data,
-                subtask=subtask, class_name=class_name,
-                taskchain=taskchain, taskid=taskid,
-                task_name=d.get("task", ""),
-            )
-        return cls(
-            msg=msg, uuid=uuid, raw=data,
-            subtask=subtask, class_name=class_name,
-            taskchain=taskchain, taskid=taskid,
-        )
-
-    def _parse_subtask_extra(
-        self, data: dict, *,
-        msg: int, uuid: str, subtask: str, class_name: str, taskchain: str, taskid: int,
-    ) -> Event:
-        if data.get("subtask") == "ProcessTask":
-            return self._parse_process_task(
-                data, msg=msg, uuid=uuid, taskchain=taskchain, taskid=taskid,
-            )
-
-        what = data.get("what", "")
-        parser = self._subtask_extra_parsers.get(what)
-        if parser is not None:
-            return parser(data, msg=msg, uuid=uuid, subtask=subtask,
-                          class_name=class_name, taskchain=taskchain, taskid=taskid)
-
-        return UnknownSubTaskEvent(
-            msg=msg, uuid=uuid, raw=data,
-            subtask=subtask, class_name=class_name,
-            taskchain=taskchain, taskid=taskid,
-        )
-
-    def _parse_process_task(
-        self, data: dict, *,
-        msg: int, uuid: str, taskchain: str, taskid: int,
-    ) -> Event:
-        sub_details = data.get("details", {})
-        return ProcessTaskEvent(
-            msg=msg, uuid=uuid, raw=data,
-            subtask=data.get("subtask", ""),
-            class_name=data.get("class", ""),
-            taskchain=taskchain, taskid=taskid,
-            what=data.get("what", ""),
-            task_name=sub_details.get("task", ""),
-            exec_times=sub_details.get("exec_times", 0),
-            max_times=sub_details.get("max_times", 0),
-            action=sub_details.get("action", 0),
-            algorithm=sub_details.get("algorithm", 0),
-        )
-
-    def _parse_stage_drops(
-        self, data: dict, **kwargs,
-    ) -> Event:
-        sub_details = data.get("details", {})
-        drops_raw = sub_details.get("drops", [])
-        stage_raw = sub_details.get("stage", {})
-        stats_raw = sub_details.get("stats", [])
-        return StageDropsEvent(
-            **kwargs,
-            drops=[DropItem(**d) for d in drops_raw],
-            stage=StageInfo(**stage_raw) if stage_raw else StageInfo(),
-            stars=sub_details.get("stars", 0),
-            stats=[StatItem(**s) for s in stats_raw],
-        )
-
-    def _parse_recruit_tags_detected(self, data: dict, **kwargs) -> Event:
-        return RecruitTagsDetectedEvent(
-            **kwargs,
-            tags=data.get("details", {}).get("tags", []),
-        )
-
-    def _parse_recruit_special_tag(self, data: dict, **kwargs) -> Event:
-        return RecruitTagsDetectedEvent(
-            **kwargs,
-            tags=[data.get("details", {}).get("tag", "")],
-        )
-
-    def _parse_recruit_preserved_tag(self, data: dict, **kwargs) -> Event:
-        return RecruitTagsDetectedEvent(
-            **kwargs,
-            tags=[data.get("details", {}).get("tag", "")],
-        )
-
-    def _parse_recruit_result(self, data: dict, **kwargs) -> Event:
-        sub_details = data.get("details", {})
-        return RecruitResultEvent(
-            **kwargs,
-            tags=sub_details.get("tags", []),
-            level=sub_details.get("level", 0),
-            result=[RecruitOption(**r) for r in sub_details.get("result", [])],
-        )
-
-    def _parse_recruit_no_permit(self, _data: dict, **kwargs) -> Event:
-        return UnknownSubTaskEvent(**kwargs)
-
-    def _parse_recruit_tags_refreshed(self, data: dict, **kwargs) -> Event:
-        sub_details = data.get("details", {})
-        return RecruitTagsRefreshedEvent(
-            **kwargs,
-            count=sub_details.get("count", 0),
-            refresh_limit=sub_details.get("refresh_limit", 3),
-        )
-
-    def _parse_recruit_tags_selected(self, data: dict, **kwargs) -> Event:
-        return RecruitTagsSelectedEvent(
-            **kwargs,
-            tags=data.get("details", {}).get("tags", []),
-        )
-
-    def _parse_facility(self, data: dict, **kwargs) -> Event:
-        sub_details = data.get("details", {})
-        what = data.get("what", "")
-        return FacilityEvent(
-            **kwargs,
-            what=what,
-            facility=sub_details.get("facility", ""),
-            index=sub_details.get("index", 0),
-            product=sub_details.get("product") if what == "ProductOfFacility" else None,
-        )
-
-    def _parse_stage_info(self, data: dict, **kwargs) -> Event:
-        return StageInfoEvent(
-            **kwargs,
-            name=data.get("details", {}).get("name", ""),
-        )
-
-    def _parse_operbox(self, data: dict, **kwargs) -> Event | None:
-        """流式干员数据：C++ 每次回调发送全量 m_own_opers 和全量 all_opers。
-
-        中间分片和最终回调均触发事件，用户可通过 done 字段区分。
-        """
-        taskid = kwargs.get("taskid", 0)
-        sub_details = data.get("details", {})
-        done: bool = sub_details.get("done", False)
-
-        event = OperBoxEvent(
-            **kwargs,
-            done=done,
-            all_opers=sub_details.get("all_opers", []),
-            own_opers=sub_details.get("own_opers", []),
-        )
-
-        if done and taskid in self._streaming_buffers:
-            del self._streaming_buffers[taskid]
-
-        return event
-
-    def _parse_depot(self, data: dict, **kwargs) -> Event | None:
-        """流式仓库数据：C++ 每次回调发送全量 m_all_items 的 JSON string。
-
-        中间分片和最终回调均触发事件，用户可通过 done 字段区分。
-        details.data 是 JSON 字符串，解析后为 {item_id: quantity, ...}。
-        """
-        import json
-
-        taskid = kwargs.get("taskid", 0)
-        sub_details = data.get("details", {})
-        done: bool = sub_details.get("done", False)
-        data_str: str = sub_details.get("data", "")
-
-        parsed: dict = {}
-        if data_str:
-            try:
-                parsed = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        event = DepotEvent(
-            **kwargs,
-            done=done,
-            items=parsed if isinstance(parsed, dict) else {},
-        )
-
-        if done and taskid in self._streaming_buffers:
-            del self._streaming_buffers[taskid]
-
-        return event
-
-    # ── 事件分发 ──
-
-    def _dispatch(self, event: Event) -> None:
-        """分发事件到所有匹配的订阅者。调用者需保证非 C 线程。"""
-        taskid = getattr(event, "taskid", None)
-
-        with self._lock:
-            if taskid:
-                tag = self._taskid_to_tag.get(taskid)
-                if tag:
-                    events = self._task_events[tag]
-                    if len(events) < _MAX_TASK_EVENTS:
-                        events.append(event)
-
-            if isinstance(event, StageDropsEvent):
-                acc = self._accumulators[event.taskid]
-                for s in event.stats:
-                    acc["stats"][s.item_id] = max(
-                        acc["stats"].get(s.item_id, 0), s.quantity
-                    )
-
-        for handler in self._listeners.get(type(event), []):
-            self._safe_call(handler, event)
-        for handler in self._listeners.get(Event, []):
-            self._safe_call(handler, event)
-
-        if taskid:
-            tag = self._taskid_to_tag.get(taskid)
-            if tag and tag in self._tag_listeners:
-                for handler in self._tag_listeners[tag].get(type(event), []):
-                    self._safe_call(handler, event)
-
-        if taskid and taskid in self._taskid_listeners:
-            for handler in self._taskid_listeners[taskid].get(type(event), []):
-                self._safe_call(handler, event)
-
-    def _safe_call(self, handler, event: Event) -> None:
-        try:
-            handler(event)
-        except Exception:
-            _logger.debug("Event handler error", exc_info=True)
-
-    # ── 便捷查询 ──
 
     def get_task_events(self, tag: str) -> list[Event]:
         with self._lock:
@@ -566,52 +168,147 @@ class CallbackManager:
 
     def get_accumulated(self, taskid: int, item_id: str) -> int:
         with self._lock:
-            return self._accumulators[taskid]["stats"].get(item_id, 0)
+            return self._accumulators[taskid].stats.get(item_id, 0)
 
+    def get_all_accumulated(self, taskid: int) -> dict[str, int]:
+        """返回指定任务的全部累计掉落统计快照。"""
+        with self._lock:
+            acc = self._accumulators.get(taskid)
+            if acc is None:
+                return {}
+            return dict(acc.stats)
 
-# ── 事件子类型 ──
+    # ── 委托给 CallbackParser 的解析方法（供测试使用） ──
 
-from dataclasses import dataclass, field
+    def _parse_subtask(self, msg_id: AsstMsg, data: JsonDict) -> Event:
+        return self._parser._parse_subtask(msg_id, data)
 
+    def _parse_taskchain(self, msg_id: AsstMsg, data: JsonDict) -> Event:
+        return self._parser._parse_taskchain(msg_id, data)
 
-@dataclass(slots=True, frozen=True)
-class DropItem:
-    item_id: str = ""
-    item_name: str = ""
-    quantity: int = 0
+    def _parse_report_request(self, msg_id: AsstMsg, data: JsonDict) -> Event:
+        return self._parser._parse_report_request(msg_id, data)
 
-    def __init__(self, itemId: str = "", itemName: str = "", quantity: int = 0):
-        object.__setattr__(self, "item_id", itemId)
-        object.__setattr__(self, "item_name", itemName)
-        object.__setattr__(self, "quantity", quantity)
+    def _parse_connection_info(self, msg_id: AsstMsg, data: JsonDict) -> Event:
+        return self._parser._parse_connection_info(msg_id, data)
 
+    def _parse_async_call_info(self, msg_id: AsstMsg, data: JsonDict) -> Event:
+        return self._parser._parse_async_call_info(msg_id, data)
 
-@dataclass(slots=True, frozen=True)
-class StageInfo:
-    stage_code: str = ""
-    stage_id: str = ""
+    # ── 内部 ──
 
-    def __init__(self, stageCode: str = "", stageId: str = ""):
-        object.__setattr__(self, "stage_code", stageCode)
-        object.__setattr__(self, "stage_id", stageId)
+    def _make_c_callback(self):
+        """创建 C 回调，C++ 线程只负责解码和入队"""
 
+        @ffi.callback(ASST_API_CALLBACK_TYPE)
+        def _cb(msg: int, details_json, custom_arg) -> None:
+            del custom_arg
+            try:
+                if details_json == ffi.NULL:
+                    data: JsonDict = {}
+                else:
+                    payload_bytes = ffi.string(details_json)
+                    data = decode_json_dict(payload_bytes)
+                event = self._parser.parse_and_route(msg, data)
+                if event is not None:
+                    self._msg_queue.put(event)
+            except Exception as exc:
+                _logger.warning("C callback parse error: %s", exc)
+                self._msg_queue.put(self._parser.make_callback_error(msg, "parse", exc))
 
-@dataclass(slots=True, frozen=True)
-class StatItem:
-    item_id: str = ""
-    item_name: str = ""
-    quantity: int = 0
-    add_quantity: int = 0
+        return _cb
 
-    def __init__(self, itemId: str = "", itemName: str = "", quantity: int = 0, addQuantity: int = 0):
-        object.__setattr__(self, "item_id", itemId)
-        object.__setattr__(self, "item_name", itemName)
-        object.__setattr__(self, "quantity", quantity)
-        object.__setattr__(self, "add_quantity", addQuantity)
+    def _dispatch_loop(self) -> None:
+        """后台线程持续 drain 队列并分发事件"""
+        while not self._shutdown.is_set():
+            try:
+                event = self._msg_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except Exception:
+                _logger.exception("Dispatch queue error")
+                continue
+            if isinstance(event, _StopEvent):
+                break
+            try:
+                self._dispatch(event)
+            except Exception:
+                _logger.exception("Dispatch loop error")
 
+    def _dispatch(self, event: Event) -> None:
+        """把事件发给所有匹配的订阅者，且支持父类订阅命中子类事件"""
+        taskid = getattr(event, "taskid", None)
 
-@dataclass(slots=True, frozen=True)
-class RecruitOption:
-    tags: list[str] = field(default_factory=list)
-    level: int = 0
-    opers: list[dict] = field(default_factory=list)
+        with self._lock:
+            self._event_archive.append(event)
+            if taskid:
+                tag = self._taskid_to_tag.get(taskid)
+                if tag:
+                    tagged_events = self._task_events[tag]
+                    if len(tagged_events) < _MAX_TASK_EVENTS:
+                        tagged_events.append(event)
+
+            if isinstance(event, StageDropsEvent):
+                accumulator = self._accumulators[event.taskid]
+                for stat in event.stats:
+                    accumulator.stats[stat.item_id] = max(
+                        accumulator.stats.get(stat.item_id, 0),
+                        stat.quantity,
+                    )
+
+            # 沿 MRO 向上派发，订阅基类时也能接住具体子类事件
+            dispatch_types = self._mro_dispatch_types(type(event))
+
+            listeners: list[Callable[[Event], None]] = []
+            for event_type in dispatch_types:
+                listeners.extend(self._listeners.get(event_type, []))
+
+            tag_handlers: list[Callable[[Event], None]] = []
+            if taskid:
+                tag = self._taskid_to_tag.get(taskid)
+                if tag and tag in self._tag_listeners:
+                    for event_type in dispatch_types:
+                        tag_handlers.extend(self._tag_listeners[tag].get(event_type, []))
+
+            taskid_handlers: list[Callable[[Event], None]] = []
+            if taskid and taskid in self._taskid_listeners:
+                for event_type in dispatch_types:
+                    taskid_handlers.extend(self._taskid_listeners[taskid].get(event_type, []))
+
+        seen_handlers: set[int] = set()
+        for handler in chain(listeners, tag_handlers, taskid_handlers):
+            marker = id(handler)
+            if marker in seen_handlers:
+                continue
+            seen_handlers.add(marker)
+            self._safe_call(handler, event)
+
+    def _mro_dispatch_types(self, event_type: type) -> list[type]:
+        """缓存 MRO 中 Event 子类的列表，避免每次分发都重新计算。"""
+        cache = getattr(self, "_mro_cache", None)
+        if cache is None:
+            cache = {}
+            self._mro_cache = cache
+        if event_type in cache:
+            return cache[event_type]
+        result = [
+            cls
+            for cls in event_type.__mro__
+            if cls is not object and issubclass(cls, Event)
+        ]
+        cache[event_type] = result
+        return result
+
+    def _safe_call(self, handler: Callable[[Event], None], event: Event) -> None:
+        try:
+            handler(event)
+        except Exception as exc:
+            _logger.exception("Event handler error")
+            error = CallbackErrorEvent(
+                msg=event.msg,
+                uuid=event.uuid,
+                source="handler",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            with self._lock:
+                self._event_archive.append(error)
