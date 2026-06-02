@@ -1,8 +1,9 @@
 [project]
 name = "maapy"
 version = "0.1.0"
-description = "maa的python绑定 "
+description = "maa的python绑定"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "ptrfufu", email = "ptrfufu@outlook.com" }
 ]
@@ -11,6 +12,21 @@ dependencies = [
     "cffi>=1.15",
  "msgspec>=0.18",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/ptrfufu/maapy" # 替换为真实地址
+"Bug Tracker" = "https://github.com/ptrfufu/maapy/issues"
 
 [build-system]
 requires = ["hatchling"]
